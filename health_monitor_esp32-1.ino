@@ -1,62 +1,19 @@
-/* ============================================================================
-   MONITOR KESEHATAN ESP32 — MAX30102 + OLED + DFPlayer Mini
-   ----------------------------------------------------------------------------
-   Wiring (sesuai catatan project):
-     I2C   : SDA -> GPIO21, SCL -> GPIO22   (dipakai bersama MAX30102 & OLED)
-     UART2 : ESP32 RX2(GPIO16) <- TX DFPlayer Mini
-             ESP32 TX2(GPIO17) -> RX DFPlayer Mini
-     GND   : semua modul disatukan (common ground) ke GND battery shield
-     3V3   : ke VIN/VCC MAX30102 dan VDD OLED
-     5V (battery shield) : ke VCC DFPlayer Mini
-     SPK+/SPK- DFPlayer   : ke speaker 8 ohm 0.5W
-
-   PENTING SEBELUM UPLOAD:
-   1. Cek chip driver OLED Anda (lihat catatan di fungsi initOLED()).
-   2. Isi nomor track sesuai urutan file di SD card DFPlayer
-      (format nama file 0001.mp3, 0002.mp3, dst). Untuk fitur "suara sebut
-      angka", rekam 17 klip pendek Bahasa Indonesia lalu taruh di track 10-26
-      (urutan persis ada di daftar TRACK_* di bawah): nol, satu, dua, tiga,
-      empat, lima, enam, tujuh, delapan, sembilan, sepuluh, sebelas,
-      "belas" (sufiks), "puluh" (sufiks), seratus, "bpm", "persen".
-   3. MODE AKSESIBILITAS (alat ini utk pengguna dgn kurang penglihatan):
-      rekam 3 klip tambahan di track 30-32:
-        track 30: "Letakkan jari Anda di sensor"
-        track 31: "Jari terdeteksi, mohon tahan sebentar"
-        track 32: "Pembacaan selesai, Anda boleh angkat jari"
-      Semua panduan disuarakan otomatis - layar OLED sifatnya pelengkap saja
-      (mis. utk pendamping/caregiver yang bisa melihat).
-
-   LIBRARY YANG PERLU DIINSTALL (Arduino IDE > Library Manager):
-     - "Adafruit SH110X" + "Adafruit GFX Library"
-     - "SparkFun MAX3010x Pulse and Proximity Sensor Library"
-     - "DFRobotDFPlayerMini"
-   Board: pilih board ESP32 Dev Module.
-   ============================================================================ */
-
 #include <Wire.h>
-
 #include <Adafruit_GFX.h>
-#include <Adafruit_SH110X.h>     // GANTI ke <Adafruit_SSD1306.h> kalau chip OLED Anda SSD1306, bukan SH1106
-                                  // (modul OLED 1.3" 128x64 KEBANYAKAN pakai chip SH1106, bukan SSD1306 -
-                                  //  kalau pakai library yang salah, layar tampil geser/terpotong)
-
-#include "MAX30105.h"            // SparkFun MAX3010x library (kompatibel dengan MAX30102)
+#include <Adafruit_SH110X.h>     
+#include "MAX30105.h"            
 #include "heartRate.h"
-
 #include <DFRobotDFPlayerMini.h>
 
-// ---------------------- PIN ----------------------
 #define PIN_SDA   21
 #define PIN_SCL   22
 #define DF_RX_PIN 16   // ESP32 RX2 <- TX DFPlayer
 #define DF_TX_PIN 17   // ESP32 TX2 -> RX DFPlayer
 
-// Nomor track di SD card DFPlayer - sesuaikan dengan file Anda
 #define TRACK_BOOT         1
 #define TRACK_HR_TINGGI    2   // dipakai jg sbg nada alert sebelum sebut angka saat BPM tinggi
 #define TRACK_SPO2_RENDAH  3   // dipakai jg sbg nada alert sebelum sebut angka saat SpO2 rendah
 
-// Track suara sebut angka (rekam 17 klip pendek Bahasa Indonesia)
 #define TRACK_UNIT_BASE     10  // track angka 0-9 = TRACK_UNIT_BASE + digit
 #define TRACK_NOL           10
 #define TRACK_SATU          11
@@ -76,32 +33,25 @@
 #define TRACK_BPM_SUFFIX    25  // kata "bpm"
 #define TRACK_PERSEN_SUFFIX 26  // kata "persen"
 
-// Track panduan suara aksesibilitas (utk pengguna kurang penglihatan)
 #define TRACK_PROMPT_LETAKKAN    30  // "Letakkan jari Anda di sensor"
 #define TRACK_PROMPT_TERDETEKSI  31  // "Jari terdeteksi, mohon tahan sebentar"
 #define TRACK_PROMPT_ANGKAT      32  // "Pembacaan selesai, Anda boleh angkat jari"
 
 #define MAX_SPEECH_TRACKS   6   // maks token per ucapan (nada alert + angka + sufiks satuan)
 
-// ---------------------- OBJEK ----------------------
 Adafruit_SH1106G display = Adafruit_SH1106G(128, 64, &Wire, -1);
 MAX30105 particleSensor;
 DFRobotDFPlayerMini dfPlayer;
 
-// ---------------------- VARIABEL DETAK JANTUNG ----------------------
 unsigned long lastBeatMs = 0;
 int   bpmAvg = 0; // nama variabel dipertahankan (dipakai di banyak tempat), tapi isinya murni bacaan instan, tanpa rata-rata
 
-// Penyaring noise TANPA rata-rata: hanya membandingkan 1 bacaan baru vs 1 bacaan valid terakhir (bukan blending/smoothing)
 int   lastValidBpm = 0;
 byte  hrRejectStreak = 0;
 const byte HR_REJECT_STREAK_RESET = 2;  // ditolak 2x beruntun -> acuan lama dianggap basi, ganti ke bacaan berikutnya
 const float HR_MAX_JUMP = 0.4;          // tolak lompatan >40% dari bacaan valid sebelumnya (ciri noise, bukan detak asli)
 bool  bpmCapturedThisCycle = false;     // sudah ada 1 bacaan BPM valid di siklus taruh-jari saat ini?
 
-// ---------------------- VARIABEL SpO2 (estimasi rasio AC/DC) ----------------------
-// CATATAN: ini estimasi kasar untuk prototipe berbasis rasio R, BUKAN alat ukur medis.
-// Untuk akurasi klinis dibutuhkan algoritma referensi Maxim + kalibrasi.
 const int BUF_SIZE = 100;
 uint32_t irBuf[BUF_SIZE];
 uint32_t redBuf[BUF_SIZE];
@@ -109,7 +59,6 @@ int   bufIdx = 0;
 bool  bufFull = false;
 float spo2Estimate = 0;
 
-// Penyaring noise SpO2, sama prinsipnya dgn BPM: bandingkan ke 1 hasil valid terakhir, bukan rata-rata tambahan
 float spo2LastValid = 0;
 byte  spo2RejectStreak = 0;
 const byte SPO2_REJECT_STREAK_RESET = 3;
@@ -117,16 +66,13 @@ const float SPO2_MAX_JUMP = 8.0; // tolak lompatan >8 poin persen dari bacaan va
 bool  fingerDetected = false;
 bool  max30102Ok = false; // false kalau MAX30102 gagal terdeteksi saat setup()
 
-// Debounce deteksi jari: irValue boleh sesaat nyelip di bawah ambang tanpa langsung dianggap "jari lepas"
 bool  rawFingerNow = false;
 unsigned long fingerStateChangeMs = 0;
 const unsigned long FINGER_DEBOUNCE_MS = 300; // status baru dianggap sah kalau bertahan minimal segini lama
 
-// ---------------------- TIMER ----------------------
 unsigned long lastDisplayMs = 0;
 const unsigned long DISPLAY_INTERVAL_MS = 300;
 
-// ---------------------- VARIABEL "SUARA SEBUT ANGKA" ----------------------
 int  speechQueue[MAX_SPEECH_TRACKS];
 int  speechQueueLen = 0;
 int  speechIndex = 0;
@@ -134,10 +80,6 @@ bool speechPlaying = false;
 unsigned long speechTrackStartMs = 0;
 const unsigned long SPEECH_TRACK_TIMEOUT_MS = 4000; // jaga-jaga kalau notifikasi "selesai" dari DFPlayer tidak sampai
 
-// ---------------------- VARIABEL PANDUAN SUARA (aksesibilitas) ----------------------
-// Alur linear satu arah:
-//   TAHAP1 letakkan jari -> TAHAP2 jari terdeteksi -> TAHAP3 pembacaan selesai
-//   -> TAHAP4 sebut angka BPM -> TAHAP5 sebut angka SpO2 (langsung, tanpa delay) -> balik lagi ke TAHAP1
 enum GuidanceStage { STAGE_LETAKKAN, STAGE_TERDETEKSI, STAGE_SELESAI, STAGE_BPM, STAGE_SPO2 };
 GuidanceStage stage = STAGE_LETAKKAN;
 
@@ -197,9 +139,6 @@ void loop() {
   voiceGuidance();
 }
 
-// ============================================================================
-// INISIALISASI
-// ============================================================================
 void initOLED() {
   // begin(alamat_i2c, reset). 1.3" 128x64 umumnya SH1106 @ 0x3C.
   if (!display.begin(0x3C, true)) {
@@ -220,9 +159,7 @@ void initMAX30102() {
     return; // TIDAK hang lagi - program lanjut jalan supaya OLED & fitur lain tetap bisa dites
   }
   max30102Ok = true;
-  // powerLevel diturunin dari 0x7F -> 0x3F (0x7F ternyata bikin ADC saturasi total, irValue mentok 262143,
-  // checkForBeat jadi nggak pernah kepicu sama sekali karena sinyal flat). adcRange dinaikin 4096 -> 16384
-  // biar ada headroom lebih longgar terhadap cahaya pantulan, nggak gampang mentok lagi.
+
   particleSensor.setup(0x3F, 4, 2, 400, 411, 16384);
 }
 
@@ -240,9 +177,6 @@ void initDFPlayer() {
   }
 }
 
-// ============================================================================
-// DETAK JANTUNG & SpO2
-// ============================================================================
 void updateHeartRate(uint32_t irValue) {
   if (!checkForBeat(irValue)) return;
 
@@ -345,9 +279,6 @@ void computeSpO2() {
   spo2Estimate = est;
 }
 
-// ============================================================================
-// OLED & ALERT AUDIO
-// ============================================================================
 void updateDisplay() {
   display.clearDisplay();
   display.setTextColor(SH110X_WHITE);
@@ -376,11 +307,6 @@ void updateDisplay() {
   display.display();
 }
 
-// ============================================================================
-// "SUARA SEBUT ANGKA" - pemutar berurutan non-blocking di DFPlayer Mini
-// ============================================================================
-// Memecah angka 0-199 jadi token track sesuai cara baca angka Indonesia.
-// Contoh: 85 -> [delapan][puluh][lima], 110 -> [seratus][sepuluh]
 int numberToTracks(int n, int *out, int maxOut) {
   int count = 0;
   if (n < 0) n = 0;
@@ -417,7 +343,6 @@ int numberToTracks(int n, int *out, int maxOut) {
   return count;
 }
 
-// Fungsi inti pemuat antrean - dipakai bareng oleh speakNumber() & speakSingle()
 void queueTracks(int *tracks, int count) {
   if (speechPlaying || count <= 0) return;
 
@@ -456,9 +381,6 @@ void speakSingle(int track) {
   queueTracks(tmp, 1);
 }
 
-// ============================================================================
-// PANDUAN SUARA - taruh/angkat jari (aksesibilitas utk pengguna kurang penglihatan)
-// ============================================================================
 void voiceGuidance() {
   switch (stage) {
 
@@ -533,8 +455,7 @@ void advanceSpeechQueue() {
   }
 }
 
-// Dipanggil tiap loop() - dengar notifikasi "selesai main" dari DFPlayer lewat
-// pin TX-nya, lalu lanjutkan ke track berikutnya dalam antrean.
+
 void pollDFPlayer() {
   if (dfPlayer.available()) {
     uint8_t type = dfPlayer.readType();
